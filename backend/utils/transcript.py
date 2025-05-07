@@ -135,9 +135,24 @@ class TranscriptProcessor:
             'cancelled': False
         }
 
-        # Set output directory
-        output_folder = output_dir if output_dir else Config.OUTPUT_FOLDER
-        os.makedirs(output_folder, exist_ok=True)
+        # Set base output directory
+        base_output_folder = output_dir if output_dir else Config.OUTPUT_FOLDER
+        os.makedirs(base_output_folder, exist_ok=True)
+
+        # For channels, create a subdirectory with the channel name
+        if not is_single_video and videos and len(videos) > 0:
+            # Get channel name from the first video (all videos should be from the same channel)
+            channel_name = videos[0].get('channelTitle', 'channel')
+            # Create a safe directory name
+            safe_channel_name = ''.join(c if c.isalnum() or c in ' -_' else '_' for c in channel_name)
+            safe_channel_name = safe_channel_name.strip()[:50]  # Limit length
+
+            # Create channel directory
+            output_folder = os.path.join(base_output_folder, safe_channel_name)
+            os.makedirs(output_folder, exist_ok=True)
+        else:
+            # For single videos, use the base output folder
+            output_folder = base_output_folder
 
         all_transcripts = []
         videos_with_transcripts = []
@@ -426,9 +441,60 @@ class TranscriptProcessor:
         }
         file_index = 1
 
+        # Set a hard maximum token limit per file (except for all-in-one file)
+        # This is to prevent files from becoming too large
+        MAX_TOKENS_PER_FILE = 150000
+
+        # Use the smaller of the user-specified limit and the hard maximum
+        effective_token_limit = min(token_limit, MAX_TOKENS_PER_FILE)
+
         for transcript in transcripts:
+            # Special case: if a single transcript exceeds the token limit
+            if transcript['token_count'] > effective_token_limit:
+                # If we already have content in the current file, save it first
+                if current_file['videos']:
+                    file_path = os.path.join(folder, f'combined_part_{file_index}.txt')
+                    current_file['file_path'] = file_path
+
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        f.write(current_file['content'])
+
+                    output_files.append({
+                        'file_path': file_path,
+                        'videos': current_file['videos'],
+                        'token_count': current_file['token_count']
+                    })
+
+                    # Start a new file
+                    file_index += 1
+                    current_file = {
+                        'videos': [],
+                        'content': '',
+                        'token_count': 0,
+                        'file_path': ''
+                    }
+
+                # Create a separate file for this large transcript
+                file_path = os.path.join(folder, f'large_video_{transcript["video_id"]}.txt')
+
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(f"### VIDEO: {transcript['title']} (ID: {transcript['video_id']})\n\n")
+                    f.write(transcript['transcript'])
+
+                output_files.append({
+                    'file_path': file_path,
+                    'videos': [{
+                        'id': transcript['video_id'],
+                        'title': transcript['title']
+                    }],
+                    'token_count': transcript['token_count']
+                })
+
+                # Continue to the next transcript
+                continue
+
             # If adding this transcript would exceed the token limit, save current file and start a new one
-            if current_file['token_count'] + transcript['token_count'] > token_limit and current_file['videos']:
+            if current_file['token_count'] + transcript['token_count'] > effective_token_limit and current_file['videos']:
                 file_path = os.path.join(folder, f'combined_part_{file_index}.txt')
                 current_file['file_path'] = file_path
 
@@ -480,7 +546,7 @@ class TranscriptProcessor:
 
         Args:
             transcripts (list): List of transcript dictionaries
-            file_limit (int): Maximum number of files
+            file_limit (int): Maximum number of files (not a target, just a limit)
             output_folder (str, optional): Output directory. Defaults to Config.OUTPUT_FOLDER.
 
         Returns:
@@ -491,20 +557,91 @@ class TranscriptProcessor:
 
         folder = output_folder if output_folder else Config.OUTPUT_FOLDER
 
-        # Calculate how many transcripts per file
-        transcripts_per_file = max(1, len(transcripts) // file_limit)
+        # Set a hard maximum token limit per file
+        MAX_TOKENS_PER_FILE = 150000
         output_files = []
 
-        for i in range(0, len(transcripts), transcripts_per_file):
-            batch = transcripts[i:i + transcripts_per_file]
-            file_index = (i // transcripts_per_file) + 1
+        # First, try to distribute content efficiently without exceeding file_limit
+        # Start with one transcript per file and then combine if needed
+
+        # Step 1: Group transcripts that are too small on their own
+        # This helps avoid creating too many tiny files
+        grouped_transcripts = []
+        current_group = []
+        current_group_tokens = 0
+
+        # Sort transcripts by size (largest first) to optimize distribution
+        sorted_transcripts = sorted(transcripts, key=lambda t: t['token_count'], reverse=True)
+
+        for transcript in sorted_transcripts:
+            # If this transcript is large enough on its own or would exceed the token limit
+            if transcript['token_count'] > 10000 or current_group_tokens + transcript['token_count'] > MAX_TOKENS_PER_FILE:
+                # If we have a current group, add it to grouped_transcripts
+                if current_group:
+                    grouped_transcripts.append({
+                        'transcripts': current_group,
+                        'token_count': current_group_tokens
+                    })
+                    current_group = []
+                    current_group_tokens = 0
+
+                # Add this transcript as its own group
+                if transcript['token_count'] > 0:  # Skip empty transcripts
+                    grouped_transcripts.append({
+                        'transcripts': [transcript],
+                        'token_count': transcript['token_count']
+                    })
+            else:
+                # Add to current group
+                current_group.append(transcript)
+                current_group_tokens += transcript['token_count']
+
+        # Add any remaining group
+        if current_group:
+            grouped_transcripts.append({
+                'transcripts': current_group,
+                'token_count': current_group_tokens
+            })
+
+        # Step 2: If we have more groups than file_limit, combine smaller groups
+        if len(grouped_transcripts) > file_limit:
+            # Sort groups by token count (smallest first)
+            grouped_transcripts.sort(key=lambda g: g['token_count'])
+
+            # Combine groups until we're within the file limit
+            while len(grouped_transcripts) > file_limit:
+                # Take the two smallest groups
+                if len(grouped_transcripts) >= 2:
+                    smallest = grouped_transcripts.pop(0)
+                    second_smallest = grouped_transcripts.pop(0)
+
+                    # Combine them if the total is under the token limit
+                    combined_tokens = smallest['token_count'] + second_smallest['token_count']
+                    if combined_tokens <= MAX_TOKENS_PER_FILE:
+                        combined_group = {
+                            'transcripts': smallest['transcripts'] + second_smallest['transcripts'],
+                            'token_count': combined_tokens
+                        }
+                        grouped_transcripts.append(combined_group)
+                        # Re-sort the list
+                        grouped_transcripts.sort(key=lambda g: g['token_count'])
+                    else:
+                        # If combining would exceed token limit, keep the larger one and discard the smaller
+                        grouped_transcripts.append(second_smallest)
+                else:
+                    # Not enough groups to combine
+                    break
+
+        # Step 3: Create files from the grouped transcripts
+        for i, group in enumerate(grouped_transcripts):
+            file_index = i + 1
             file_path = os.path.join(folder, f'combined_part_{file_index}.txt')
 
             content = ''
             videos = []
             token_count = 0
 
-            for transcript in batch:
+            for transcript in group['transcripts']:
                 videos.append({
                     'id': transcript['video_id'],
                     'title': transcript['title']
