@@ -24,9 +24,20 @@ class Config:
     DOWNLOADS_FOLDER = os.path.join(USER_HOME, 'Downloads')
     OUTPUT_FOLDER = DOWNLOADS_FOLDER if os.path.exists(DOWNLOADS_FOLDER) else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'output')
 
+    # Cache configuration
+    CACHE_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cache')
+    CACHE_ENABLED = True
+    CACHE_TTL = 7 * 24 * 60 * 60  # Cache time-to-live in seconds (7 days)
+
+    # Performance tuning
+    MAX_WORKERS = 10  # Maximum number of concurrent workers
+    BATCH_SIZE = 50   # Number of videos to process in a batch
+    BUFFER_SIZE = 1024 * 1024  # Buffer size for file I/O (1MB)
+
     # Ensure directories exist
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    os.makedirs(CACHE_FOLDER, exist_ok=True)
 
     @classmethod
     def save_quota_info(cls, quota_info):

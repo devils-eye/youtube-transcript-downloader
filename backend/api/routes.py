@@ -86,7 +86,8 @@ def process_channel():
                 'title': video_info['snippet']['title'],
                 'description': video_info['snippet']['description'],
                 'publishedAt': video_info['snippet']['publishedAt'],
-                'thumbnails': video_info['snippet']['thumbnails']
+                'thumbnails': video_info['snippet']['thumbnails'],
+                'channelTitle': video_info['snippet']['channelTitle']  # Include channel title
             }
 
             # Get channel ID from the video

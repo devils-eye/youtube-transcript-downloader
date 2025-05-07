@@ -10,6 +10,8 @@ backend/.env
 backend/output/
 backend/uploads/
 backend/instance/
+backend/cache/
+backend/quota_info.json
 backend/.pytest_cache/
 backend/.coverage
 backend/htmlcov/

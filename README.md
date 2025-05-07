@@ -1,6 +1,6 @@
 # YouTube Transcript Downloader
 
-A web application that allows users to download transcripts from YouTube videos for RAG (Retrieval-Augmented Generation) or AI training purposes.
+A high-performance web application that allows users to download transcripts from YouTube videos for RAG (Retrieval-Augmented Generation) or AI training purposes.
 
 ## Features
 
@@ -10,6 +10,11 @@ A web application that allows users to download transcripts from YouTube videos 
 - Select preferred language for transcripts
 - Choose output format based on token limit or file limit
 - View processing results and download transcript files
+- Parallel processing for faster transcript downloads
+- Caching mechanism to avoid redundant downloads
+- Optimized file I/O for better performance
+- Support for both single video and channel URLs
+- Organize channel outputs in directories named after the channel
 
 ## Project Structure
 
@@ -29,25 +34,30 @@ The project consists of two main parts:
 ### Backend Setup
 
 1. Navigate to the backend directory:
+
    ```
    cd backend
    ```
 
 2. Create a virtual environment:
+
    ```
    python -m venv venv
    ```
 
 3. Activate the virtual environment:
+
    - Windows: `venv\\Scripts\\activate`
    - macOS/Linux: `source venv/bin/activate`
 
 4. Install dependencies:
+
    ```
    pip install -r requirements.txt
    ```
 
 5. Create a `.env` file in the backend directory with your YouTube API key:
+
    ```
    FLASK_APP=app.py
    FLASK_DEBUG=True
@@ -63,16 +73,19 @@ The project consists of two main parts:
 ### Frontend Setup
 
 1. Navigate to the frontend directory:
+
    ```
    cd frontend
    ```
 
 2. Install dependencies:
+
    ```
    npm install
    ```
 
 3. Run the development server:
+
    ```
    npm run dev
    ```
@@ -95,12 +108,24 @@ The project consists of two main parts:
 - `POST /api/process-transcripts`: Process transcripts for multiple videos
 - `GET /api/download/{filename}`: Download a processed transcript file
 
+## Performance Optimizations
+
+The application includes several performance optimizations:
+
+- **Parallel Processing**: Uses Python's `concurrent.futures` to download and process multiple transcripts simultaneously
+- **Caching Mechanism**: Stores downloaded transcripts to avoid redundant API calls and speed up repeated operations
+- **Optimized File I/O**: Uses buffered I/O and parallel file writing for better performance
+- **Batch Processing**: Processes videos in batches to reduce memory usage
+- **Configurable Parameters**: Allows tuning of performance parameters like worker count and buffer size
+
 ## Technologies Used
 
 - **Backend**:
+
   - Flask (Python web framework)
   - YouTube Data API (for channel and video data)
   - YouTube Transcript API (for transcript downloading)
+  - Concurrent.futures (for parallel processing)
 
 - **Frontend**:
   - Next.js (React framework)

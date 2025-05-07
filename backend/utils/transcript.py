@@ -1,6 +1,8 @@
 import os
 import json
+import time
 import shutil
+import concurrent.futures
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.formatters import TextFormatter
 from config import Config
@@ -9,6 +11,7 @@ class TranscriptProcessor:
     def __init__(self):
         """Initialize the transcript processor."""
         self.text_formatter = TextFormatter()
+        self.youtube_api = None  # Will be set by the API routes
 
     def get_available_languages(self, video_id):
         """Get available transcript languages for a video.
@@ -52,6 +55,12 @@ class TranscriptProcessor:
         Returns:
             dict: Transcript data or None if not available
         """
+        # Check cache first if enabled
+        cached_transcript = self._get_cached_transcript(video_id, language_code)
+        if cached_transcript:
+            print(f"Using cached transcript for video {video_id} in language {language_code}")
+            return cached_transcript
+
         try:
             # First check if the language is available
             available_languages = self.get_available_languages(video_id)
@@ -65,6 +74,13 @@ class TranscriptProcessor:
             # If requested language is not available but other languages are, try to get the first available
             if language_code not in language_codes and language_codes:
                 print(f"Language {language_code} not available for video {video_id}. Using {language_codes[0]} instead.")
+
+                # Check cache for the fallback language
+                fallback_cached = self._get_cached_transcript(video_id, language_codes[0])
+                if fallback_cached:
+                    print(f"Using cached transcript for video {video_id} in fallback language {language_codes[0]}")
+                    return fallback_cached
+
                 language_code = language_codes[0]
             elif not language_codes:
                 # No languages available
@@ -73,6 +89,10 @@ class TranscriptProcessor:
             # Use the static method to get the transcript
             try:
                 transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=[language_code])
+
+                # Cache the transcript
+                self._cache_transcript(video_id, language_code, transcript)
+
                 return transcript
             except Exception as inner_e:
                 # Try with the first available language as a fallback
@@ -80,6 +100,10 @@ class TranscriptProcessor:
                     print(f"Trying fallback language {language_codes[0]} for video {video_id}")
                     try:
                         transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=[language_codes[0]])
+
+                        # Cache the fallback transcript
+                        self._cache_transcript(video_id, language_codes[0], transcript)
+
                         return transcript
                     except:
                         pass
@@ -141,8 +165,31 @@ class TranscriptProcessor:
 
         # For channels, create a subdirectory with the channel name
         if not is_single_video and videos and len(videos) > 0:
-            # Get channel name from the first video (all videos should be from the same channel)
-            channel_name = videos[0].get('channelTitle', 'channel')
+            # Try to get channel name from different possible properties
+            # First video should have the channel information (all videos should be from the same channel)
+            video = videos[0]
+
+            # Try different possible properties where channel name might be stored
+            channel_name = None
+            if 'channelTitle' in video:
+                channel_name = video['channelTitle']
+            elif 'snippet' in video and 'channelTitle' in video['snippet']:
+                channel_name = video['snippet']['channelTitle']
+
+            # If we still don't have a channel name, try to extract from other videos
+            if not channel_name:
+                for v in videos:
+                    if 'channelTitle' in v:
+                        channel_name = v['channelTitle']
+                        break
+                    elif 'snippet' in v and 'channelTitle' in v['snippet']:
+                        channel_name = v['snippet']['channelTitle']
+                        break
+
+            # If we still don't have a channel name, use a default with timestamp
+            if not channel_name:
+                channel_name = f"youtube_channel_{int(time.time())}"
+
             # Create a safe directory name
             safe_channel_name = ''.join(c if c.isalnum() or c in ' -_' else '_' for c in channel_name)
             safe_channel_name = safe_channel_name.strip()[:50]  # Limit length
@@ -188,41 +235,76 @@ class TranscriptProcessor:
             if progress_callback:
                 progress_callback(0, len(videos), "Starting transcript download...")
 
-        # Download all available transcripts
-        for i, video in enumerate(videos):
-            # Check for cancellation
-            if cancel_flag and cancel_flag.get('cancelled', False):
-                results['cancelled'] = True
-                if progress_callback:
-                    progress_callback(i, len(videos), "Operation cancelled")
-                return results
+        # Download all available transcripts using parallel processing
+        # Determine the number of workers based on the number of videos and configuration
+        max_workers = min(Config.MAX_WORKERS, len(videos))
 
-            # Update progress
-            if progress_callback:
-                progress_callback(i, len(videos), f"Processing video {i + 1} of {len(videos)}: {video['title']}")
+        # Process videos in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_video = {
+                executor.submit(self._process_single_video, video, language_code, cancel_flag): video
+                for video in videos
+            }
 
-            transcript = self.download_transcript(video['id'], language_code)
+            # Process results as they complete
+            for i, future in enumerate(concurrent.futures.as_completed(future_to_video)):
+                # Check for cancellation
+                if cancel_flag and cancel_flag.get('cancelled', False):
+                    results['cancelled'] = True
+                    if progress_callback:
+                        progress_callback(i, len(videos), "Operation cancelled")
+                    # Cancel all pending futures
+                    for f in future_to_video:
+                        f.cancel()
+                    return results
 
-            if transcript:
-                formatted_text = self.format_transcript_text(transcript)
-                all_transcripts.append({
-                    'video_id': video['id'],
-                    'title': video['title'],
-                    'transcript': formatted_text,
-                    'token_count': self._estimate_token_count(formatted_text)
-                })
-                results['successful'].append({
-                    'id': video['id'],
-                    'title': video['title']
-                })
-            else:
-                results['failed'].append({
-                    'id': video['id'],
-                    'title': video['title'],
-                    'reason': 'Transcript not available'
-                })
+                # Get the original video for this future
+                video = future_to_video[future]
 
-            processed_count += 1
+                try:
+                    # Get the result from the future
+                    result = future.result()
+
+                    # Update progress
+                    processed_count += 1
+                    if progress_callback:
+                        progress_callback(processed_count, len(videos),
+                                         f"Processing video {processed_count} of {len(videos)}: {video['title']}")
+
+                    # Process the result
+                    if result.get('success', False):
+                        # Add to successful transcripts
+                        all_transcripts.append({
+                            'video_id': result['video_id'],
+                            'title': result['title'],
+                            'transcript': result['transcript'],
+                            'token_count': result['token_count']
+                        })
+                        results['successful'].append({
+                            'id': result['video_id'],
+                            'title': result['title']
+                        })
+                    else:
+                        # Add to failed transcripts
+                        results['failed'].append({
+                            'id': result['video_id'],
+                            'title': result['title'],
+                            'reason': result.get('reason', 'Unknown error')
+                        })
+
+                except Exception as e:
+                    # Handle any exceptions from the future
+                    processed_count += 1
+                    if progress_callback:
+                        progress_callback(processed_count, len(videos),
+                                         f"Error processing video {processed_count} of {len(videos)}")
+
+                    results['failed'].append({
+                        'id': video['id'],
+                        'title': video['title'],
+                        'reason': f'Error: {str(e)}'
+                    })
 
         # Check for cancellation before file processing
         if cancel_flag and cancel_flag.get('cancelled', False):
@@ -421,7 +503,7 @@ class TranscriptProcessor:
         return len(text) // 4
 
     def _process_by_token_limit(self, transcripts, token_limit, output_folder=None):
-        """Process transcripts by token limit.
+        """Process transcripts by token limit with optimized I/O.
 
         Args:
             transcripts (list): List of transcript dictionaries
@@ -433,13 +515,6 @@ class TranscriptProcessor:
         """
         folder = output_folder if output_folder else Config.OUTPUT_FOLDER
         output_files = []
-        current_file = {
-            'videos': [],
-            'content': '',
-            'token_count': 0,
-            'file_path': ''
-        }
-        file_index = 1
 
         # Set a hard maximum token limit per file (except for all-in-one file)
         # This is to prevent files from becoming too large
@@ -448,96 +523,117 @@ class TranscriptProcessor:
         # Use the smaller of the user-specified limit and the hard maximum
         effective_token_limit = min(token_limit, MAX_TOKENS_PER_FILE)
 
-        for transcript in transcripts:
-            # Special case: if a single transcript exceeds the token limit
-            if transcript['token_count'] > effective_token_limit:
-                # If we already have content in the current file, save it first
-                if current_file['videos']:
-                    file_path = os.path.join(folder, f'combined_part_{file_index}.txt')
-                    current_file['file_path'] = file_path
+        # Process in batches for better memory efficiency
+        batch_size = min(Config.BATCH_SIZE, len(transcripts))
 
-                    with open(file_path, 'w', encoding='utf-8') as f:
-                        f.write(current_file['content'])
+        # Split transcripts into batches
+        for i in range(0, len(transcripts), batch_size):
+            batch = transcripts[i:i+batch_size]
+
+            # Process this batch
+            current_batch = {
+                'videos': [],
+                'transcripts': [],
+                'token_count': 0
+            }
+            file_index = len(output_files) + 1
+
+            for transcript in batch:
+                # Special case: if a single transcript exceeds the token limit
+                if transcript['token_count'] > effective_token_limit:
+                    # If we already have content in the current batch, save it first
+                    if current_batch['videos']:
+                        # Write the current batch to a file
+                        file_path = os.path.join(folder, f'combined_part_{file_index}.txt')
+
+                        # Write directly to file with buffering
+                        with open(file_path, 'w', encoding='utf-8', buffering=Config.BUFFER_SIZE) as f:
+                            for t in current_batch['transcripts']:
+                                f.write(f"\n\n### VIDEO: {t['title']} (ID: {t['video_id']})\n\n")
+                                f.write(t['transcript'])
+
+                        output_files.append({
+                            'file_path': file_path,
+                            'videos': current_batch['videos'].copy(),
+                            'token_count': current_batch['token_count']
+                        })
+
+                        # Start a new batch
+                        file_index += 1
+                        current_batch = {
+                            'videos': [],
+                            'transcripts': [],
+                            'token_count': 0
+                        }
+
+                    # Create a separate file for this large transcript
+                    file_path = os.path.join(folder, f'large_video_{transcript["video_id"]}.txt')
+
+                    # Write directly to file with buffering
+                    with open(file_path, 'w', encoding='utf-8', buffering=Config.BUFFER_SIZE) as f:
+                        f.write(f"### VIDEO: {transcript['title']} (ID: {transcript['video_id']})\n\n")
+                        f.write(transcript['transcript'])
 
                     output_files.append({
                         'file_path': file_path,
-                        'videos': current_file['videos'],
-                        'token_count': current_file['token_count']
+                        'videos': [{
+                            'id': transcript['video_id'],
+                            'title': transcript['title']
+                        }],
+                        'token_count': transcript['token_count']
                     })
 
-                    # Start a new file
+                    # Continue to the next transcript
+                    continue
+
+                # If adding this transcript would exceed the token limit, save current batch and start a new one
+                if current_batch['token_count'] + transcript['token_count'] > effective_token_limit and current_batch['videos']:
+                    # Write the current batch to a file
+                    file_path = os.path.join(folder, f'combined_part_{file_index}.txt')
+
+                    # Write directly to file with buffering
+                    with open(file_path, 'w', encoding='utf-8', buffering=Config.BUFFER_SIZE) as f:
+                        for t in current_batch['transcripts']:
+                            f.write(f"\n\n### VIDEO: {t['title']} (ID: {t['video_id']})\n\n")
+                            f.write(t['transcript'])
+
+                    output_files.append({
+                        'file_path': file_path,
+                        'videos': current_batch['videos'].copy(),
+                        'token_count': current_batch['token_count']
+                    })
+
+                    # Start a new batch
                     file_index += 1
-                    current_file = {
+                    current_batch = {
                         'videos': [],
-                        'content': '',
-                        'token_count': 0,
-                        'file_path': ''
+                        'transcripts': [],
+                        'token_count': 0
                     }
 
-                # Create a separate file for this large transcript
-                file_path = os.path.join(folder, f'large_video_{transcript["video_id"]}.txt')
-
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(f"### VIDEO: {transcript['title']} (ID: {transcript['video_id']})\n\n")
-                    f.write(transcript['transcript'])
-
-                output_files.append({
-                    'file_path': file_path,
-                    'videos': [{
-                        'id': transcript['video_id'],
-                        'title': transcript['title']
-                    }],
-                    'token_count': transcript['token_count']
+                # Add transcript to current batch
+                current_batch['videos'].append({
+                    'id': transcript['video_id'],
+                    'title': transcript['title']
                 })
+                current_batch['transcripts'].append(transcript)
+                current_batch['token_count'] += transcript['token_count']
 
-                # Continue to the next transcript
-                continue
-
-            # If adding this transcript would exceed the token limit, save current file and start a new one
-            if current_file['token_count'] + transcript['token_count'] > effective_token_limit and current_file['videos']:
+            # Save the last batch if it has content
+            if current_batch['videos']:
                 file_path = os.path.join(folder, f'combined_part_{file_index}.txt')
-                current_file['file_path'] = file_path
 
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(current_file['content'])
+                # Write directly to file with buffering
+                with open(file_path, 'w', encoding='utf-8', buffering=Config.BUFFER_SIZE) as f:
+                    for t in current_batch['transcripts']:
+                        f.write(f"\n\n### VIDEO: {t['title']} (ID: {t['video_id']})\n\n")
+                        f.write(t['transcript'])
 
                 output_files.append({
                     'file_path': file_path,
-                    'videos': current_file['videos'],
-                    'token_count': current_file['token_count']
+                    'videos': current_batch['videos'],
+                    'token_count': current_batch['token_count']
                 })
-
-                # Start a new file
-                file_index += 1
-                current_file = {
-                    'videos': [],
-                    'content': '',
-                    'token_count': 0,
-                    'file_path': ''
-                }
-
-            # Add transcript to current file
-            current_file['videos'].append({
-                'id': transcript['video_id'],
-                'title': transcript['title']
-            })
-            current_file['content'] += f"\n\n### VIDEO: {transcript['title']} (ID: {transcript['video_id']})\n\n"
-            current_file['content'] += transcript['transcript']
-            current_file['token_count'] += transcript['token_count']
-
-        # Save the last file if it has content
-        if current_file['videos']:
-            file_path = os.path.join(folder, f'combined_part_{file_index}.txt')
-            current_file['file_path'] = file_path
-
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(current_file['content'])
-
-            output_files.append({
-                'file_path': file_path,
-                'videos': current_file['videos'],
-                'token_count': current_file['token_count']
-            })
 
         return output_files
 
@@ -662,7 +758,7 @@ class TranscriptProcessor:
         return output_files
 
     def _process_individual_files(self, transcripts, output_folder):
-        """Create individual files for each video transcript.
+        """Create individual files for each video transcript with optimized I/O.
 
         Args:
             transcripts (list): List of transcript dictionaries
@@ -673,30 +769,60 @@ class TranscriptProcessor:
         """
         output_files = []
 
-        for transcript in transcripts:
-            # Create a sanitized filename from the video title
-            safe_title = ''.join(c if c.isalnum() or c in ' -_' else '_' for c in transcript['title'])
-            safe_title = safe_title.strip()[:100]  # Limit length
+        # Process in batches to reduce I/O overhead
+        batch_size = min(Config.BATCH_SIZE, len(transcripts))
 
-            file_path = os.path.join(output_folder, f"{safe_title}_{transcript['video_id']}.txt")
+        # Use ThreadPoolExecutor for parallel file writing
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, batch_size)) as executor:
+            # Submit tasks for each transcript
+            future_to_transcript = {
+                executor.submit(self._write_transcript_file, transcript, output_folder): transcript
+                for transcript in transcripts
+            }
 
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(f"### VIDEO: {transcript['title']} (ID: {transcript['video_id']})\n\n")
-                f.write(transcript['transcript'])
-
-            output_files.append({
-                'file_path': file_path,
-                'videos': [{
-                    'id': transcript['video_id'],
-                    'title': transcript['title']
-                }],
-                'token_count': transcript['token_count']
-            })
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(future_to_transcript):
+                try:
+                    file_info = future.result()
+                    output_files.append(file_info)
+                except Exception as e:
+                    transcript = future_to_transcript[future]
+                    print(f"Error writing transcript file for video {transcript['video_id']}: {e}")
 
         return output_files
 
+    def _write_transcript_file(self, transcript, output_folder):
+        """Write a single transcript file with optimized buffering.
+
+        Args:
+            transcript (dict): Transcript dictionary
+            output_folder (str): Output directory
+
+        Returns:
+            dict: Output file information
+        """
+        # Create a sanitized filename from the video title
+        safe_title = ''.join(c if c.isalnum() or c in ' -_' else '_' for c in transcript['title'])
+        safe_title = safe_title.strip()[:100]  # Limit length
+
+        file_path = os.path.join(output_folder, f"{safe_title}_{transcript['video_id']}.txt")
+
+        # Use buffered I/O for better performance
+        with open(file_path, 'w', encoding='utf-8', buffering=Config.BUFFER_SIZE) as f:
+            f.write(f"### VIDEO: {transcript['title']} (ID: {transcript['video_id']})\n\n")
+            f.write(transcript['transcript'])
+
+        return {
+            'file_path': file_path,
+            'videos': [{
+                'id': transcript['video_id'],
+                'title': transcript['title']
+            }],
+            'token_count': transcript['token_count']
+        }
+
     def _create_all_in_one_file(self, transcripts, output_folder):
-        """Create a single file with all transcripts.
+        """Create a single file with all transcripts using optimized I/O.
 
         Args:
             transcripts (list): List of transcript dictionaries
@@ -709,21 +835,22 @@ class TranscriptProcessor:
             return None
 
         file_path = os.path.join(output_folder, 'all_transcripts.txt')
-        content = ''
         videos = []
         token_count = 0
 
-        for transcript in transcripts:
-            videos.append({
-                'id': transcript['video_id'],
-                'title': transcript['title']
-            })
-            content += f"\n\n### VIDEO: {transcript['title']} (ID: {transcript['video_id']})\n\n"
-            content += transcript['transcript']
-            token_count += transcript['token_count']
+        # Use buffered I/O for better performance
+        with open(file_path, 'w', encoding='utf-8', buffering=Config.BUFFER_SIZE) as f:
+            for transcript in transcripts:
+                videos.append({
+                    'id': transcript['video_id'],
+                    'title': transcript['title']
+                })
 
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(content)
+                # Write directly to file instead of building a large string in memory
+                f.write(f"\n\n### VIDEO: {transcript['title']} (ID: {transcript['video_id']})\n\n")
+                f.write(transcript['transcript'])
+
+                token_count += transcript['token_count']
 
         return {
             'file_path': file_path,
@@ -732,7 +859,7 @@ class TranscriptProcessor:
         }
 
     def _process_batch_by_token_limit(self, batch, token_limit, output_folder, start_index=1):
-        """Process a batch of transcripts by token limit.
+        """Process a batch of transcripts by token limit with optimized I/O.
 
         Args:
             batch (list): List of transcript dictionaries
@@ -744,65 +871,67 @@ class TranscriptProcessor:
             list: Output file information
         """
         output_files = []
-        current_file = {
+        current_batch = {
             'videos': [],
-            'content': '',
-            'token_count': 0,
-            'file_path': ''
+            'transcripts': [],
+            'token_count': 0
         }
         file_index = start_index
 
         for transcript in batch:
-            # If adding this transcript would exceed the token limit, save current file and start a new one
-            if current_file['token_count'] + transcript['token_count'] > token_limit and current_file['videos']:
+            # If adding this transcript would exceed the token limit, save current batch and start a new one
+            if current_batch['token_count'] + transcript['token_count'] > token_limit and current_batch['videos']:
+                # Write the current batch to a file
                 file_path = os.path.join(output_folder, f'combined_part_{file_index}.txt')
-                current_file['file_path'] = file_path
 
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(current_file['content'])
+                # Write directly to file with buffering
+                with open(file_path, 'w', encoding='utf-8', buffering=Config.BUFFER_SIZE) as f:
+                    for t in current_batch['transcripts']:
+                        f.write(f"\n\n### VIDEO: {t['title']} (ID: {t['video_id']})\n\n")
+                        f.write(t['transcript'])
 
                 output_files.append({
                     'file_path': file_path,
-                    'videos': current_file['videos'],
-                    'token_count': current_file['token_count']
+                    'videos': current_batch['videos'].copy(),  # Make a copy to avoid reference issues
+                    'token_count': current_batch['token_count']
                 })
 
-                # Start a new file
+                # Start a new batch
                 file_index += 1
-                current_file = {
+                current_batch = {
                     'videos': [],
-                    'content': '',
-                    'token_count': 0,
-                    'file_path': ''
+                    'transcripts': [],
+                    'token_count': 0
                 }
 
-            # Add transcript to current file
-            current_file['videos'].append({
+            # Add transcript to current batch
+            current_batch['videos'].append({
                 'id': transcript['video_id'],
                 'title': transcript['title']
             })
-            current_file['content'] += f"\n\n### VIDEO: {transcript['title']} (ID: {transcript['video_id']})\n\n"
-            current_file['content'] += transcript['transcript']
-            current_file['token_count'] += transcript['token_count']
+            current_batch['transcripts'].append(transcript)
+            current_batch['token_count'] += transcript['token_count']
 
-        # Save the last file if it has content
-        if current_file['videos']:
+        # Save the last batch if it has content
+        if current_batch['videos']:
             file_path = os.path.join(output_folder, f'combined_part_{file_index}.txt')
-            current_file['file_path'] = file_path
 
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(current_file['content'])
+            # Write directly to file with buffering
+            with open(file_path, 'w', encoding='utf-8', buffering=Config.BUFFER_SIZE) as f:
+                for t in current_batch['transcripts']:
+                    f.write(f"\n\n### VIDEO: {t['title']} (ID: {t['video_id']})\n\n")
+                    f.write(t['transcript'])
 
             output_files.append({
                 'file_path': file_path,
-                'videos': current_file['videos'],
-                'token_count': current_file['token_count']
+                'videos': current_batch['videos'],
+                'token_count': current_batch['token_count']
             })
 
         return output_files
 
     def _combine_excess_files(self, excess_files, output_folder):
-        """Combine excess files into a single file.
+        """Combine excess files into a single file with optimized I/O.
 
         Args:
             excess_files (list): List of file information dictionaries
@@ -815,31 +944,143 @@ class TranscriptProcessor:
             return None
 
         file_path = os.path.join(output_folder, 'excess_content.txt')
-        content = ''
         videos = []
         token_count = 0
 
-        for file_info in excess_files:
-            videos.extend(file_info['videos'])
+        # Use buffered I/O for better performance
+        with open(file_path, 'w', encoding='utf-8', buffering=Config.BUFFER_SIZE) as out_file:
+            for file_info in excess_files:
+                videos.extend(file_info['videos'])
+                token_count += file_info['token_count']
 
-            # Read the content from the file
-            with open(file_info['file_path'], 'r', encoding='utf-8') as f:
-                file_content = f.read()
+                # Read and write in chunks to reduce memory usage
+                with open(file_info['file_path'], 'r', encoding='utf-8') as in_file:
+                    # Copy content in chunks
+                    chunk_size = 1024 * 1024  # 1MB chunks
+                    while True:
+                        chunk = in_file.read(chunk_size)
+                        if not chunk:
+                            break
+                        out_file.write(chunk)
 
-            content += file_content + "\n\n"
-            token_count += file_info['token_count']
+                    # Add separator between files
+                    out_file.write("\n\n")
 
-            # Remove the original file
-            try:
-                os.remove(file_info['file_path'])
-            except Exception as e:
-                print(f"Error removing file {file_info['file_path']}: {e}")
-
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(content)
+                # Remove the original file
+                try:
+                    os.remove(file_info['file_path'])
+                except Exception as e:
+                    print(f"Error removing file {file_info['file_path']}: {e}")
 
         return {
             'file_path': file_path,
             'videos': videos,
             'token_count': token_count
         }
+
+    def _get_cached_transcript(self, video_id, language_code):
+        """Get transcript from cache if available.
+
+        Args:
+            video_id (str): YouTube video ID
+            language_code (str): Language code for the transcript
+
+        Returns:
+            list: Cached transcript data or None if not available
+        """
+        if not Config.CACHE_ENABLED:
+            return None
+
+        cache_file = os.path.join(Config.CACHE_FOLDER, f"{video_id}_{language_code}.json")
+
+        # Check if cache file exists and is not expired
+        if os.path.exists(cache_file):
+            try:
+                # Get file modification time
+                mod_time = os.path.getmtime(cache_file)
+                current_time = time.time()
+
+                # Check if cache is still valid
+                if current_time - mod_time < Config.CACHE_TTL:
+                    with open(cache_file, 'r', encoding='utf-8') as f:
+                        return json.load(f)
+                else:
+                    # Cache expired, remove the file
+                    os.remove(cache_file)
+            except Exception as e:
+                print(f"Error reading cache for video {video_id}: {e}")
+
+        return None
+
+    def _cache_transcript(self, video_id, language_code, transcript):
+        """Save transcript to cache.
+
+        Args:
+            video_id (str): YouTube video ID
+            language_code (str): Language code for the transcript
+            transcript (list): Transcript data to cache
+        """
+        if not Config.CACHE_ENABLED or not transcript:
+            return
+
+        cache_file = os.path.join(Config.CACHE_FOLDER, f"{video_id}_{language_code}.json")
+
+        try:
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(transcript, f)
+        except Exception as e:
+            print(f"Error writing cache for video {video_id}: {e}")
+
+    def _process_single_video(self, video, language_code, cancel_flag=None):
+        """Process a single video to download and format its transcript.
+
+        This method is designed to be used with concurrent processing.
+
+        Args:
+            video (dict): Video information dictionary
+            language_code (str): Language code for the transcript
+            cancel_flag (dict, optional): Dictionary with a 'cancelled' key to check for cancellation
+
+        Returns:
+            dict: Processing result with video info and transcript data or error
+        """
+        # Check for cancellation
+        if cancel_flag and cancel_flag.get('cancelled', False):
+            return {
+                'success': False,
+                'video_id': video['id'],
+                'title': video['title'],
+                'reason': 'Operation cancelled',
+                'cancelled': True
+            }
+
+        try:
+            # Download transcript
+            transcript = self.download_transcript(video['id'], language_code)
+
+            if transcript:
+                # Format transcript
+                formatted_text = self.format_transcript_text(transcript)
+                token_count = self._estimate_token_count(formatted_text)
+
+                return {
+                    'success': True,
+                    'video_id': video['id'],
+                    'title': video['title'],
+                    'transcript': formatted_text,
+                    'token_count': token_count
+                }
+            else:
+                return {
+                    'success': False,
+                    'video_id': video['id'],
+                    'title': video['title'],
+                    'reason': 'Transcript not available'
+                }
+        except Exception as e:
+            return {
+                'success': False,
+                'video_id': video['id'],
+                'title': video['title'],
+                'reason': f'Error: {str(e)}'
+            }

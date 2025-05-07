@@ -175,17 +175,19 @@ class YouTubeAPI:
         next_page_token = None
 
         try:
-            # First, get upload playlist ID
+            # First, get channel details including upload playlist ID and channel title
             self._track_quota_usage('channels.list')
             response = self.youtube.channels().list(
-                part='contentDetails',
+                part='contentDetails,snippet',
                 id=channel_id
             ).execute()
 
             if not response.get('items'):
                 return []
 
-            uploads_playlist_id = response['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+            channel_item = response['items'][0]
+            uploads_playlist_id = channel_item['contentDetails']['relatedPlaylists']['uploads']
+            channel_title = channel_item['snippet']['title']
 
             # Then get videos from the uploads playlist
             while True:
@@ -203,7 +205,8 @@ class YouTubeAPI:
                         'title': item['snippet']['title'],
                         'description': item['snippet']['description'],
                         'publishedAt': item['snippet']['publishedAt'],
-                        'thumbnails': item['snippet']['thumbnails']
+                        'thumbnails': item['snippet']['thumbnails'],
+                        'channelTitle': channel_title  # Add channel title to each video
                     }
                     videos.append(video_info)
 
