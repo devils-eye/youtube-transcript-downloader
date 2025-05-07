@@ -7,6 +7,11 @@
   --background-rgb: 249, 249, 249;
 }
 
+.dark {
+  --foreground-rgb: 255, 255, 255;
+  --background-rgb: 17, 24, 39;
+}
+
 body {
   color: rgb(var(--foreground-rgb));
   background: rgb(var(--background-rgb));
@@ -17,7 +22,7 @@ body {
   width: 36px;
   height: 36px;
   border-radius: 50%;
-  border-left-color: #FF0000;
+  border-left-color: #ff0000;
   animation: spin 1s linear infinite;
 }
 

@@ -48,6 +48,11 @@ export default function Home({
       <Navbar darkMode={darkMode} setDarkMode={handleDarkModeChange} />
 
       <div className="container mx-auto px-4 py-4 space-y-8">
+        {/* API Quota Display */}
+        <div className="max-w-3xl mx-auto mb-4">
+          <QuotaDisplay />
+        </div>
+
         <section className="mb-8">
           <div className="max-w-3xl mx-auto text-center mb-8">
             <h2 className="text-3xl font-bold mb-4 text-gray-800 dark:text-white">
